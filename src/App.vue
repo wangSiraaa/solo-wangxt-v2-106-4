@@ -3,6 +3,16 @@ import { computed, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { buildGear, validateGearInput, DEG, transformOutline, type GearGeometry, type Pt } from './geometry/gear'
 import { analyzeMesh, gearAnglesAt, mateAngle, type MeshInfo } from './geometry/mesh'
 import { intersectOutlines } from './geometry/clipper'
+import {
+  buildMeasurementRecord,
+  measurementStatus,
+  newMeasurementId,
+  outlineFingerprint,
+  signedDeviation,
+  deviationHistogram,
+  type MeasurementRecord,
+  type MeasurementStatus
+} from './geometry/measurement'
 import { GearViewer, type ViewerOptions } from './viewer'
 import { UNITS, fromMm, toMm, fmtLen, type LengthUnit } from './units'
 import {
@@ -171,6 +181,8 @@ watch(
     contactS.value = 0
     interferenceArea.value = null
     interferenceRegions.value = []
+    // 基准参数已变：旧测量自动转为历史证据（状态由指纹判定），仅重绘覆盖层
+    pushMeasurementOverlay()
   }
 )
 
@@ -190,6 +202,166 @@ function scrubContact() {
   if (playing.value || !g1.value || !g2.value || !mesh.value) return
   phi1.value = gearAnglesAt(mesh.value, g1.value, g2.value, contactS.value).phi1
 }
+
+// ------- 实测轮廓覆盖层（仅对比展示，不扩大模型适用范围） -------
+const measurements = ref<MeasurementRecord[]>([])
+const measGear = ref<1 | 2>(1)
+const measError = ref('')
+const measReport = ref('')
+const measBusy = ref(false)
+const showMeasurement = ref(true)
+
+interface MeasView {
+  rec: MeasurementRecord
+  status: MeasurementStatus
+  reason: string
+}
+
+/** 每条测量相对当前理论模型的状态（指纹失配 → 仅历史证据） */
+const measViews = computed<MeasView[]>(() =>
+  measurements.value.map((rec) => {
+    const g = rec.gear === 1 ? g1.value : g2.value
+    const st = measurementStatus(rec, g)
+    return { rec, ...st }
+  })
+)
+
+function currentFingerprint(gearIdx: 1 | 2): string {
+  const g = gearIdx === 1 ? g1.value : g2.value
+  return g ? outlineFingerprint(g) : ''
+}
+
+function importMeasurementFile(ev: Event) {
+  const input = ev.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  const reader = new FileReader()
+  reader.onload = () => {
+    // 先完整校验再入列；任何一步失败都不产生记录（数据库无残留）
+    try {
+      const target = measGear.value === 1 ? g1.value : g2.value
+      if (!target) throw new Error('当前齿轮参数无效，无法绑定测量')
+      const rec = buildMeasurementRecord({
+        id: newMeasurementId(),
+        text: String(reader.result),
+        gear: measGear.value,
+        name: file.name,
+        target,
+        alphaDeg: gearParams.alphaDeg
+      })
+      measurements.value = [...measurements.value, rec]
+      measError.value = ''
+      measReport.value =
+        `已导入 ${rec.normalized.length} 点（源单位 ${rec.sourceUnit}` +
+        `${rec.adjustments.reversed ? '，原始点序为顺时针已反转' : ''}），` +
+        `并绑定当前齿轮 ${rec.gear} 的理论轮廓指纹。`
+    } catch (e) {
+      measError.value = (e as Error).message
+      measReport.value = ''
+    }
+  }
+  reader.readAsText(file)
+  input.value = ''
+}
+
+function removeMeasurement(id: string) {
+  measurements.value = measurements.value.filter((m) => m.id !== id)
+}
+
+/**
+ * 暂停位置用现有 Clipper 布尔能力比较实测覆盖层与对方理论轮廓的局部相交。
+ * 仅允许指纹匹配当前基准的测量参与；失配测量只是历史证据。
+ */
+async function checkMeasurement(v: MeasView) {
+  measReport.value = ''
+  if (playing.value) {
+    measReport.value = '请先暂停动画，再在暂停位置做覆盖层布尔检查'
+    return
+  }
+  if (v.status !== 'matched') {
+    measReport.value = `拒绝参与计算：${v.reason}`
+    return
+  }
+  if (!g1.value || !g2.value || !mesh.value) return
+  const selfIs1 = v.rec.gear === 1
+  const p2 = mateAngle(g1.value, g2.value, mesh.value, phi1.value)
+  const phiSelf = selfIs1 ? phi1.value : p2
+  const phiOther = selfIs1 ? p2 : phi1.value
+  const cSelf = selfIs1 ? 0 : mesh.value.a
+  const cOther = selfIs1 ? mesh.value.a : 0
+  const otherOutline = selfIs1 ? g2.value.outline : g1.value.outline
+  measBusy.value = true
+  try {
+    const res = await intersectOutlines(
+      [transformOutline(v.rec.normalized, cSelf, 0, phiSelf)],
+      [transformOutline(otherOutline, cOther, 0, phiOther)]
+    )
+    v.rec.checks.push({
+      at: Date.now(),
+      phi1: phi1.value,
+      overlapArea: res.area,
+      intersects: res.intersects,
+      fingerprint: v.rec.fingerprint
+    })
+    measReport.value =
+      `覆盖层(齿轮${v.rec.gear}) × 对方理论轮廓：重叠面积 ${res.area.toExponential(3)} mm²，` +
+      `${res.intersects ? '局部相交 ❗' : '无相交 ✅'}。仅为实测覆盖层对比，不构成啮合认证。`
+  } finally {
+    measBusy.value = false
+  }
+}
+
+/** 偏差着色：0→绿，正偏差(材料多)→红，负偏差→蓝；色标 ±5% 模数 */
+function devColor(dev: number): number {
+  const s = Math.max(1e-9, 0.05 * gearParams.m)
+  const t = Math.min(1, Math.abs(dev) / s)
+  const lerp = (a: number, b: number) => a + (b - a) * t
+  let r: number, gg: number, b: number
+  if (dev >= 0) {
+    r = lerp(0.23, 1)
+    gg = lerp(0.9, 0.18)
+    b = lerp(0.42, 0.33)
+  } else {
+    r = lerp(0.23, 0.3)
+    gg = lerp(0.9, 0.55)
+    b = lerp(0.42, 1)
+  }
+  return (Math.round(r * 255) << 16) | (Math.round(gg * 255) << 8) | Math.round(b * 255)
+}
+
+/** 每台齿轮显示最新一条测量；匹配时按偏差着色，失配时灰色（历史证据） */
+function pushMeasurementOverlay() {
+  if (!viewer) return
+  for (const gi of [1, 2] as const) {
+    const views = measViews.value.filter((v) => v.rec.gear === gi)
+    const v = views[views.length - 1]
+    if (!showMeasurement.value || !v) {
+      viewer.setMeasurementOverlay(gi, null)
+      continue
+    }
+    const g = gi === 1 ? g1.value : g2.value
+    let colors: number[] | undefined
+    if (v.status === 'matched' && g) {
+      colors = v.rec.normalized.map((p) => devColor(signedDeviation(p, g.outline)))
+    }
+    viewer.setMeasurementOverlay(gi, v.rec.normalized, colors)
+  }
+}
+
+/** 偏差直方图（匹配时实时重算；失配时回退到绑定时的历史统计） */
+function measHistogram(v: MeasView) {
+  const g = v.rec.gear === 1 ? g1.value : g2.value
+  if (v.status === 'matched' && g) {
+    return deviationHistogram(v.rec.normalized.map((p) => signedDeviation(p, g.outline)))
+  }
+  return v.rec.deviation.histogram
+}
+
+function histMax(hist: { count: number }[]): number {
+  return Math.max(1, ...hist.map((h) => h.count))
+}
+
+watch([measViews, showMeasurement, g1, g2], pushMeasurementOverlay)
 
 // ------- 案例库 -------
 const cases = ref<CaseData[]>([])
@@ -229,7 +401,8 @@ function currentCaseData(withOutlines: boolean): CaseData {
     outlines:
       withOutlines && g1.value && g2.value
         ? { gear1: g1.value.outline, gear2: g2.value.outline }
-        : undefined
+        : undefined,
+    measurements: measurements.value.length ? measurements.value : undefined
   }
 }
 
@@ -257,8 +430,12 @@ async function loadCase(c: CaseData) {
   unit.value = c.unit || 'mm'
   caseName.value = c.name
   caseNote.value = c.note
+  measurements.value = c.measurements ?? []
+  measError.value = ''
+  measReport.value = ''
   rebuild()
   if (viewer && g1.value && g2.value && mesh.value) viewer.setGears(g1.value, g2.value, mesh.value.a)
+  pushMeasurementOverlay()
 }
 
 async function removeCase(id: string) {
@@ -457,6 +634,65 @@ function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
 
       <aside class="panel right">
         <section>
+          <h2>实测轮廓覆盖层</h2>
+          <p class="note">
+            仅用于与理论渐开线轮廓并排对比；不参与理论模型计算，不代表啮合认证，
+            不扩大模型适用范围（外啮合 · 无变位 · 理想刚性）。
+          </p>
+          <div class="row">
+            <label class="row">绑定到
+              <select v-model.number="measGear">
+                <option :value="1">齿轮 1</option>
+                <option :value="2">齿轮 2</option>
+              </select>
+            </label>
+          </div>
+          <label class="wide filebtn">导入测量坐标（JSON/CSV，需声明单位，首尾闭合）
+            <input type="file" accept=".json,.csv,.txt,application/json,text/csv,text/plain" @change="importMeasurementFile" hidden />
+          </label>
+          <div v-if="measError" class="err">导入被拒绝：{{ measError }}（未写入任何数据）</div>
+          <label class="row"><input type="checkbox" v-model="showMeasurement" /> 在视图中显示覆盖层（按偏差着色：红=材料偏多，蓝=偏少）</label>
+          <ul class="caselist measlist">
+            <li v-for="v in measViews" :key="v.rec.id">
+              <div class="ci">
+                <b>{{ v.rec.name }}</b>
+                <span>齿轮 {{ v.rec.gear }} · {{ v.rec.normalized.length }} 点 · 源单位 {{ v.rec.sourceUnit }}<template v-if="v.rec.adjustments.reversed"> · 点序已反转</template></span>
+                <span>绑定：z={{ v.rec.bound.z }} m={{ v.rec.bound.module }} α={{ v.rec.bound.alphaDeg }}° · 指纹 {{ v.rec.fingerprint.slice(0, 8) }}…</span>
+                <span :class="v.status === 'matched' ? 'good' : 'bad'">
+                  {{ v.status === 'matched' ? '✅ 指纹匹配当前基准' : '⚠️ 仅历史证据（不参与当前计算）' }}
+                </span>
+                <span class="reason">{{ v.reason }}</span>
+                <span>
+                  偏差 max {{ fmt(v.rec.deviation.max) }} · min {{ fmt(v.rec.deviation.min) }} ·
+                  RMS {{ fmt(v.rec.deviation.rms) }} · 外/内 {{ v.rec.deviation.outside }}/{{ v.rec.deviation.inside }}
+                </span>
+                <span class="hist" title="偏差分布直方图">
+                  <i v-for="(b, bi) in measHistogram(v)" :key="bi"
+                     :style="{ height: (4 + 14 * b.count / histMax(measHistogram(v))) + 'px' }"
+                     :title="`${fmt(b.lo)} ~ ${fmt(b.hi)}: ${b.count} 点`"></i>
+                </span>
+                <span v-if="v.rec.checks.length" class="checks">
+                  <span v-for="(c, ci) in v.rec.checks" :key="ci">
+                    {{ new Date(c.at).toLocaleTimeString() }} · φ₁={{ c.phi1.toFixed(3) }} ·
+                    重叠 {{ c.overlapArea.toExponential(2) }} mm² · {{ c.intersects ? '局部相交 ❗' : '无相交' }}
+                    <template v-if="c.fingerprint !== currentFingerprint(v.rec.gear)">（历史结论，基准已变）</template>
+                  </span>
+                </span>
+              </div>
+              <div class="ca">
+                <button @click="checkMeasurement(v)" :disabled="playing || measBusy || v.status !== 'matched'"
+                        :title="v.status !== 'matched' ? '基准已失配，仅作历史证据' : '在暂停位置用 Clipper 比较覆盖层与对方理论轮廓'">
+                  布尔检查
+                </button>
+                <button class="del" @click="removeMeasurement(v.rec.id)">删</button>
+              </div>
+            </li>
+            <li v-if="!measViews.length" class="empty">暂无测量数据</li>
+          </ul>
+          <div v-if="measReport" class="report">{{ measReport }}</div>
+        </section>
+
+        <section>
           <h2>案例（IndexedDB）</h2>
           <input v-model="caseName" placeholder="案例名称" />
           <textarea v-model="caseNote" placeholder="备注（可选）" rows="2"></textarea>
@@ -478,7 +714,7 @@ function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
             <li v-for="c in cases" :key="c.id">
               <div class="ci">
                 <b>{{ c.name }}</b>
-                <span>{{ c.gear1.z }}/{{ c.gear2.z }} · m={{ c.gear1.module }} · α={{ c.gear1.alphaDeg }}°{{ c.outlines ? ' · 含轮廓' : '' }}</span>
+                <span>{{ c.gear1.z }}/{{ c.gear2.z }} · m={{ c.gear1.module }} · α={{ c.gear1.alphaDeg }}°{{ c.outlines ? ' · 含轮廓' : '' }}{{ c.measurements?.length ? ` · 含测量(${c.measurements.length})` : '' }}</span>
               </div>
               <div class="ca">
                 <button @click="loadCase(c)">载入</button>

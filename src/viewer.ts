@@ -37,6 +37,8 @@ export class GearViewer {
   private pitchPoint: THREE.Mesh | null = null
   private contactMarker: THREE.Mesh | null = null
   private interferenceGroup: THREE.Group
+  /** 实测轮廓覆盖层（齿轮组子对象，随齿轮旋转；仅对比展示，不参与模型计算） */
+  private measLine: (THREE.LineLoop | null)[] = [null, null]
   private raycaster = new THREE.Raycaster()
   private container: HTMLElement
   private resizeObs: ResizeObserver
@@ -148,12 +150,70 @@ export class GearViewer {
   setGears(g1: GearGeometry, g2: GearGeometry, centerDistance: number) {
     if (this.gear1) this.scene.remove(this.gear1.group)
     if (this.gear2) this.scene.remove(this.gear2.group)
+    // 旧齿轮组被移除，覆盖层随之失效（由调用方重新设置）
+    this.measLine = [null, null]
     this.gear1 = this.buildGearMesh(g1, 0x6ea8fe)
     this.gear2 = this.buildGearMesh(g2, 0xffb86e)
     this.scene.add(this.gear1.group, this.gear2.group)
     this.gear2.group.position.x = centerDistance
     // 让整对齿轮大致居中
     this.targetCenter(centerDistance / 2, Math.max(g1.addendumR, g2.addendumR))
+  }
+
+  /**
+   * 设置/清除实测轮廓覆盖层。pts 为齿轮局部坐标（mm，已归一化），
+   * 作为齿轮组的子对象绘制，随齿轮转动自动对齐。
+   * colors 为逐点颜色（偏向着色）；缺省为灰色（历史证据，基准已失配）。
+   */
+  setMeasurementOverlay(which: 1 | 2, pts: Pt[] | null, colors?: number[]) {
+    const idx = which - 1
+    const old = this.measLine[idx]
+    if (old) {
+      old.parent?.remove(old)
+      old.geometry.dispose()
+      ;(old.material as THREE.Material).dispose()
+      this.measLine[idx] = null
+    }
+    const gear = which === 1 ? this.gear1 : this.gear2
+    if (!pts || pts.length < 3 || !gear) return
+
+    gear.body.geometry.computeBoundingBox()
+    const bb = gear.body.geometry.boundingBox
+    const depth = bb ? bb.max.z - bb.min.z : 0
+    const z = depth / 2 + 0.06
+
+    const pos = new Float32Array(pts.length * 3)
+    for (let i = 0; i < pts.length; i++) {
+      pos[3 * i] = pts[i].x
+      pos[3 * i + 1] = pts[i].y
+      pos[3 * i + 2] = z
+    }
+    const geo = new THREE.BufferGeometry()
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3))
+
+    const useColors = !!colors && colors.length === pts.length
+    if (useColors) {
+      const col = new Float32Array(pts.length * 3)
+      const c = new THREE.Color()
+      for (let i = 0; i < pts.length; i++) {
+        c.setHex(colors![i])
+        col[3 * i] = c.r
+        col[3 * i + 1] = c.g
+        col[3 * i + 2] = c.b
+      }
+      geo.setAttribute('color', new THREE.BufferAttribute(col, 3))
+    }
+    const mat = new THREE.LineBasicMaterial({
+      vertexColors: useColors,
+      color: useColors ? 0xffffff : 0x9aa4b2,
+      transparent: true,
+      opacity: 0.95,
+      depthTest: false
+    })
+    const loop = new THREE.LineLoop(geo, mat)
+    loop.renderOrder = 40
+    gear.group.add(loop)
+    this.measLine[idx] = loop
   }
 
   private targetCenter(cx: number, radius: number) {

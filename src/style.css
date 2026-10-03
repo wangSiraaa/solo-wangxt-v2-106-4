@@ -82,3 +82,14 @@ th { color: #9fb4cf; font-weight: 600; }
 .ca { display: flex; gap: 4px; align-items: center; }
 .ca button { flex: 0 0 auto; padding: 3px 8px; }
 .empty { color: #6b7686; justify-content: center !important; }
+
+/* 实测轮廓覆盖层 */
+.note { font-size: 11px; color: #8b97a7; background: #0d1219; border-left: 3px solid #5c4a2f; border-radius: 4px; padding: 6px 8px; margin: 4px 0 8px; }
+.measlist .ci { min-width: 0; }
+.measlist .reason { color: #c9a35c; }
+.measlist .good, .measlist .bad { font-size: 11px; }
+select { background: #0d1219; border: 1px solid #2a3645; color: #e6edf5; border-radius: 6px; padding: 4px 6px; font-size: 12px; }
+.hist { display: flex; align-items: flex-end; gap: 1px; height: 18px; margin-top: 3px; }
+.hist i { display: inline-block; width: 8px; background: #2b5ea8; border-radius: 1px 1px 0 0; }
+.checks { display: flex; flex-direction: column; margin-top: 3px; border-top: 1px dashed #232d3a; padding-top: 3px; }
+.checks span { color: #9fb4cf; }
