@@ -6,6 +6,7 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import type { GearGeometry, Pt } from './geometry/gear'
 import type { MeshInfo } from './geometry/mesh'
+import type { MeasuredProfile } from './geometry/measured'
 
 export interface ViewerOptions {
   showPitchCircle: boolean
@@ -16,6 +17,8 @@ export interface ViewerOptions {
   showContact: boolean
   contactS: number // 啮合线参数 s（mm），仅 showContact 时
   contactRegions?: Pt[][][] // Clipper 干涉区域（世界坐标，按帧）
+  measuredRegions?: Pt[][] // 实测覆盖层与对方理论轮廓的相交区域（世界坐标）
+  showMeasuredOverlay?: boolean
 }
 
 interface GearMesh {
@@ -32,6 +35,8 @@ export class GearViewer {
   private controls: OrbitControls
   private gear1: GearMesh | null = null
   private gear2: GearMesh | null = null
+  private measured1: THREE.Group | null = null
+  private measured2: THREE.Group | null = null
   private actionLine: THREE.Line | null = null
   private tangentLine: THREE.Line | null = null
   private pitchPoint: THREE.Mesh | null = null
@@ -148,6 +153,7 @@ export class GearViewer {
   setGears(g1: GearGeometry, g2: GearGeometry, centerDistance: number) {
     if (this.gear1) this.scene.remove(this.gear1.group)
     if (this.gear2) this.scene.remove(this.gear2.group)
+    this.clearMeasuredOverlays()
     this.gear1 = this.buildGearMesh(g1, 0x6ea8fe)
     this.gear2 = this.buildGearMesh(g2, 0xffb86e)
     this.scene.add(this.gear1.group, this.gear2.group)
@@ -172,6 +178,83 @@ export class GearViewer {
   setAngles(phi1: number, phi2: number) {
     if (this.gear1) this.gear1.group.rotation.z = phi1
     if (this.gear2) this.gear2.group.rotation.z = phi2
+  }
+
+  private disposeObject(root: THREE.Object3D) {
+    root.traverse((obj) => {
+      const mesh = obj as THREE.Mesh
+      if (mesh.geometry) mesh.geometry.dispose()
+      const material = mesh.material as THREE.Material | THREE.Material[] | undefined
+      if (Array.isArray(material)) material.forEach((m) => m.dispose())
+      else material?.dispose()
+    })
+  }
+
+  private clearMeasuredOverlays() {
+    if (this.measured1) {
+      this.disposeObject(this.measured1)
+      this.scene.remove(this.measured1)
+      this.measured1 = null
+    }
+    if (this.measured2) {
+      this.disposeObject(this.measured2)
+      this.scene.remove(this.measured2)
+      this.measured2 = null
+    }
+  }
+
+  private buildMeasuredOverlay(measurement: MeasuredProfile): THREE.Group {
+    const group = new THREE.Group()
+    const deviations = measurement.deviations ?? []
+    const stats = measurement.deviationStats
+    const positions: number[] = []
+    const colors: number[] = []
+    const color = new THREE.Color()
+    for (const p of deviations) {
+      positions.push(p.x, p.y, 0.08)
+      const v = stats && stats.maxAbs > 0 ? THREE.MathUtils.clamp(p.d / stats.maxAbs, -1, 1) : 0
+      if (v < 0) color.setRGB(0.25 + 0.25 * (1 + v), 0.45 + 0.35 * (1 + v), 1)
+      else if (v > 0) color.setRGB(1, 0.55 - 0.25 * v, 0.25 - 0.15 * v)
+      else color.setRGB(0.25, 0.9, 0.55)
+      colors.push(color.r, color.g, color.b)
+    }
+    const geo = new THREE.BufferGeometry()
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3))
+    const points = new THREE.Points(
+      geo,
+      new THREE.PointsMaterial({
+        size: 0.45,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.95,
+        depthTest: false,
+        sizeAttenuation: true
+      })
+    )
+    points.renderOrder = 120
+    group.add(points)
+    return group
+  }
+
+  private overlayZ(gear: GearMesh): number {
+    gear.body.geometry.computeBoundingBox()
+    return gear.body.geometry.boundingBox ? gear.body.geometry.boundingBox.max.z + 1.2 : 1
+  }
+
+  setMeasuredOverlays(measurements: { gear1?: MeasuredProfile | null; gear2?: MeasuredProfile | null }, show: boolean) {
+    this.clearMeasuredOverlays()
+    if (!show) return
+    if (measurements.gear1?.normalizedPoints && this.gear1) {
+      this.measured1 = this.buildMeasuredOverlay(measurements.gear1)
+      this.measured1.position.z = this.overlayZ(this.gear1)
+      this.gear1.group.add(this.measured1)
+    }
+    if (measurements.gear2?.normalizedPoints && this.gear2) {
+      this.measured2 = this.buildMeasuredOverlay(measurements.gear2)
+      this.measured2.position.z = this.overlayZ(this.gear2)
+      this.gear2.group.add(this.measured2)
+    }
   }
 
   setMeshOverlay(mesh: MeshInfo | null, opts: ViewerOptions) {
@@ -254,26 +337,35 @@ export class GearViewer {
     if (opts.contactRegions) {
       for (const regionSet of opts.contactRegions) {
         for (const ring of regionSet) {
-          if (ring.length < 3) continue
-          const shape = new THREE.Shape()
-          shape.moveTo(ring[0].x, ring[0].y)
-          for (let i = 1; i < ring.length; i++) shape.lineTo(ring[i].x, ring[i].y)
-          shape.closePath()
-          const geo = new THREE.ShapeGeometry(shape)
-          const mat = new THREE.MeshBasicMaterial({
-            color: 0xff2d55,
-            transparent: true,
-            opacity: 0.5,
-            side: THREE.DoubleSide,
-            depthTest: false
-          })
-          const m = new THREE.Mesh(geo, mat)
-          m.position.z = Math.max(g1Depth, g2Depth) / 2 + 2
-          m.renderOrder = 999
-          this.interferenceGroup.add(m)
+          this.addInterferenceRing(ring, 0xff2d55, Math.max(g1Depth, g2Depth) / 2 + 2, 0.5)
         }
       }
     }
+
+    if (opts.measuredRegions) {
+      for (const ring of opts.measuredRegions) {
+        if (ring.length >= 3) this.addInterferenceRing(ring, 0xffd166, Math.max(g1Depth, g2Depth) / 2 + 2.35, 0.42)
+      }
+    }
+  }
+
+  private addInterferenceRing(ring: Pt[], color: number, z: number, opacity: number) {
+    const shape = new THREE.Shape()
+    shape.moveTo(ring[0].x, ring[0].y)
+    for (let i = 1; i < ring.length; i++) shape.lineTo(ring[i].x, ring[i].y)
+    shape.closePath()
+    const geo = new THREE.ShapeGeometry(shape)
+    const mat = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity,
+      side: THREE.DoubleSide,
+      depthTest: false
+    })
+    const m = new THREE.Mesh(geo, mat)
+    m.position.z = z
+    m.renderOrder = 1000
+    this.interferenceGroup.add(m)
   }
 
   private clearOverlay() {
@@ -298,6 +390,7 @@ export class GearViewer {
     while (this.interferenceGroup.children.length) {
       const c = this.interferenceGroup.children.pop()!
       ;(c as THREE.Mesh).geometry?.dispose()
+      ;((c as THREE.Mesh).material as THREE.Material | undefined)?.dispose()
     }
   }
 

@@ -3,6 +3,14 @@ import { computed, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { buildGear, validateGearInput, DEG, transformOutline, type GearGeometry, type Pt } from './geometry/gear'
 import { analyzeMesh, gearAnglesAt, mateAngle, type MeshInfo } from './geometry/mesh'
 import { intersectOutlines } from './geometry/clipper'
+import {
+  isMeasurementUsable,
+  parseMeasuredProfile,
+  reconcileMeasurements,
+  MEASUREMENT_SCOPE_NOTICE,
+  type MeasuredProfile,
+  type MeasurementGearKey
+} from './geometry/measured'
 import { GearViewer, type ViewerOptions } from './viewer'
 import { UNITS, fromMm, toMm, fmtLen, type LengthUnit } from './units'
 import {
@@ -87,6 +95,29 @@ const interferenceRegions = shallowRef<Pt[][]>([])
 const interferenceBusy = ref(false)
 let interfereReq = 0
 
+// ------- 实测轮廓覆盖层（证据层；不参与理论模型认证） -------
+const measurementHistory = ref<MeasuredProfile[]>([])
+const activeMeasurementId = ref<string | null>(null)
+const showMeasuredOverlay = ref(true)
+const importGearKey = ref<MeasurementGearKey>('gear1')
+const measurementDraft = ref<MeasuredProfile | null>(null)
+const measurementError = ref('')
+const measuredCheckBusy = ref(false)
+let measuredReq = 0
+
+const activeMeasurement = computed(
+  () => measurementHistory.value.find((m) => m.id === activeMeasurementId.value && m.status === 'accepted') ?? null
+)
+
+const activeByGear = computed<Record<MeasurementGearKey, MeasuredProfile | null>>(() => {
+  const item = activeMeasurement.value
+  if (!item) return { gear1: null, gear2: null }
+  return { gear1: null, gear2: null, [item.gearKey]: item }
+})
+
+const measuredIntersectionArea = ref<number | null>(null)
+const measuredIntersectionRegions = shallowRef<Pt[][]>([])
+
 async function checkInterference(currentPhi1: number) {
   if (!g1.value || !g2.value || !mesh.value) return
   const p1 = currentPhi1
@@ -114,8 +145,10 @@ function pushOverlay() {
   viewer.setMeshOverlay(mesh.value, {
     ...showOpts,
     contactS: contactS.value,
-    contactRegions: [interferenceRegions.value]
+    contactRegions: [interferenceRegions.value],
+    measuredRegions: measuredIntersectionRegions.value
   })
+  viewer.setMeasuredOverlays(activeByGear.value, showMeasuredOverlay.value)
 }
 
 onMounted(() => {
@@ -171,8 +204,22 @@ watch(
     contactS.value = 0
     interferenceArea.value = null
     interferenceRegions.value = []
+    measuredIntersectionArea.value = null
+    measuredIntersectionRegions.value = []
+    if (g1.value && g2.value) {
+      measurementHistory.value = reconcileMeasurements(measurementHistory.value, { gear1: g1.value, gear2: g2.value })
+      if (activeMeasurement.value) activeMeasurementId.value = activeMeasurement.value.id
+      else activeMeasurementId.value = null
+    }
   }
 )
+
+watch(activeByGear, () => {
+  measuredIntersectionArea.value = null
+  measuredIntersectionRegions.value = []
+  pushOverlay()
+})
+watch(showMeasuredOverlay, pushOverlay)
 
 watch(showOpts, pushOverlay)
 watch(contactS, () => (showOpts.contactS = contactS.value))
@@ -183,12 +230,59 @@ function pause() {
 }
 function resume() {
   playing.value = true
+  measuredIntersectionArea.value = null
+  measuredIntersectionRegions.value = []
 }
 
 /** 暂停时手动拖动接触点：把轮1 转到与该 s 严格对应的相位（同一条渐开线接触） */
 function scrubContact() {
   if (playing.value || !g1.value || !g2.value || !mesh.value) return
   phi1.value = gearAnglesAt(mesh.value, g1.value, g2.value, contactS.value).phi1
+}
+
+async function checkMeasuredOverlay() {
+  if (playing.value || !g1.value || !g2.value || !mesh.value) return
+  const measurement = activeMeasurement.value
+  if (!measurement || !measurement.normalizedPoints || !isMeasurementUsable(measurement, measurement.gearKey === 'gear1' ? g1.value : g2.value)) return
+  const isGear1 = measurement.gearKey === 'gear1'
+  const mate = isGear1 ? g2.value : g1.value
+  const measuredCx = isGear1 ? 0 : mesh.value.a
+  const mateCx = isGear1 ? mesh.value.a : 0
+  const measuredPhi1 = phi1.value
+  const matePhi2 = mateAngle(g1.value, g2.value, mesh.value, measuredPhi1)
+  const measuredWorldAngle = isGear1 ? measuredPhi1 : matePhi2
+  const mateTheoryAngle = isGear1 ? matePhi2 : measuredPhi1
+  const measuredWorld = [transformOutline(measurement.normalizedPoints, measuredCx, 0, measuredWorldAngle)]
+  const theoryWorld = [transformOutline(mate.outline, mateCx, 0, mateTheoryAngle)]
+  const req = ++measuredReq
+  measuredCheckBusy.value = true
+  try {
+    const res = await intersectOutlines(measuredWorld, theoryWorld)
+    if (req !== measuredReq) return
+    measuredIntersectionArea.value = res.area
+    measuredIntersectionRegions.value = res.regions
+    const conclusion = res.intersects
+      ? `实测覆盖层与对方理论轮廓局部相交（${res.area.toExponential(3)} mm²）；仅为本帧几何比对，不是啮合认证`
+      : '当前暂停帧未检出实测覆盖层与对方理论轮廓相交；不代表全程无干涉或啮合合格'
+    measurementHistory.value = measurementHistory.value.map((m) =>
+      m.id === measurement.id
+        ? {
+            ...m,
+            lastCheck: {
+              at: Date.now(),
+              gearKey: measurement.gearKey,
+              phiMeasured: measuredWorldAngle,
+              phiMate: mateTheoryAngle,
+              area: res.area,
+              intersects: res.intersects,
+              conclusion
+            }
+          }
+        : m
+    )
+  } finally {
+    if (req === measuredReq) measuredCheckBusy.value = false
+  }
 }
 
 // ------- 案例库 -------
@@ -229,7 +323,9 @@ function currentCaseData(withOutlines: boolean): CaseData {
     outlines:
       withOutlines && g1.value && g2.value
         ? { gear1: g1.value.outline, gear2: g2.value.outline }
-        : undefined
+        : undefined,
+    measurements: measurementHistory.value,
+    activeMeasurementId: activeMeasurementId.value
   }
 }
 
@@ -258,6 +354,17 @@ async function loadCase(c: CaseData) {
   caseName.value = c.name
   caseNote.value = c.note
   rebuild()
+  if (g1.value && g2.value) {
+    measurementHistory.value = reconcileMeasurements(c.measurements ?? [], { gear1: g1.value, gear2: g2.value })
+  } else {
+    measurementHistory.value = []
+  }
+  const activeId = c.activeMeasurementId
+  activeMeasurementId.value = measurementHistory.value.some((m) => m.id === activeId && m.status === 'accepted') ? activeId ?? null : null
+  measuredIntersectionArea.value = null
+  measuredIntersectionRegions.value = []
+  measurementDraft.value = null
+  measurementError.value = ''
   if (viewer && g1.value && g2.value && mesh.value) viewer.setGears(g1.value, g2.value, mesh.value.a)
 }
 
@@ -305,6 +412,70 @@ const sBounds = computed<[number, number]>(() => {
 function fmt(mm: number) {
   return fmtLen(mm, unit.value)
 }
+
+// ------- 实测文件导入 -------
+function importMeasuredFile(ev: Event) {
+  const input = ev.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file || !g1.value || !g2.value) return
+  const gearKey = importGearKey.value
+  const gear = gearKey === 'gear1' ? g1.value : g2.value
+  const reader = new FileReader()
+  reader.onload = () => {
+    try {
+      const rec = parseMeasuredProfile(String(reader.result), gear, gearKey, file.name.replace(/\.json$/i, ''))
+      measurementDraft.value = rec
+      measurementError.value = ''
+      if (rec.status === 'rejected') {
+        measurementError.value = rec.failureReasons.join('；')
+      }
+    } catch (e) {
+      measurementDraft.value = null
+      measurementError.value = (e as Error).message
+    }
+  }
+  reader.readAsText(file)
+  input.value = ''
+}
+
+function acceptDraftMeasurement() {
+  const draft = measurementDraft.value
+  if (!draft || draft.status !== 'accepted' || !g1.value || !g2.value) return
+  const gear = draft.gearKey === 'gear1' ? g1.value : g2.value
+  if (!isMeasurementUsable(draft, gear)) {
+    draft.status = 'rejected'
+    draft.failureReasons = [...draft.failureReasons, '接受前基准齿轮已经改变：该测量只能放弃后按当前基准重新导入']
+    measurementError.value = draft.failureReasons.join('；')
+    return
+  }
+  measurementHistory.value = [...measurementHistory.value, draft]
+  activeMeasurementId.value = draft.id
+  measurementDraft.value = null
+  measurementError.value = ''
+}
+
+function discardDraftMeasurement() {
+  measurementDraft.value = null
+  measurementError.value = ''
+}
+
+function selectMeasurement(id: string) {
+  const item = measurementHistory.value.find((m) => m.id === id)
+  activeMeasurementId.value = item?.status === 'accepted' ? id : null
+}
+
+function removeMeasurement(id: string) {
+  measurementHistory.value = measurementHistory.value.filter((m) => m.id !== id)
+  if (activeMeasurementId.value === id) activeMeasurementId.value = null
+}
+
+const measurementStatusLabel = computed(() => {
+  const item = activeMeasurement.value
+  if (!item) return '未选择当前可用测量'
+  return `${item.name} · ${item.gearKey === 'gear1' ? '齿轮1' : '齿轮2'} · 已绑定指纹`
+})
+
+const scopeNotice = MEASUREMENT_SCOPE_NOTICE
 
 // 预设样本：标准齿数与极少齿数，便于核对
 function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
@@ -388,6 +559,75 @@ function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
               {{ interferenceArea > 1e-6 ? '存在实体干涉 ❗' : '当前帧无干涉 ✅' }}
             </b>
           </div>
+        </section>
+
+        <section>
+          <h2>实测轮廓覆盖层（非认证）</h2>
+          <label>绑定齿轮
+            <select v-model="importGearKey">
+              <option value="gear1">齿轮 1</option>
+              <option value="gear2">齿轮 2</option>
+            </select>
+          </label>
+          <label class="wide filebtn">导入带单位二维闭合 JSON
+            <input type="file" accept="application/json,.json" @change="importMeasuredFile" hidden />
+          </label>
+
+          <div v-if="measurementError" class="err">拒绝导入：{{ measurementError }}（未保存、无数据库残留）</div>
+          <div v-if="measurementDraft" class="report">
+            <div>
+              <b :class="measurementDraft.status === 'accepted' ? 'good' : 'bad'">
+                {{ measurementDraft.status === 'accepted' ? '校验通过，可作为当前覆盖层' : '校验失败' }}
+              </b>
+            </div>
+            <div>点数：{{ measurementDraft.pointCount }}；单位：{{ measurementDraft.declaredUnit }}；方向：{{ measurementDraft.originalOrientation === 'ccw' ? 'CCW' : 'CW（已统一）' }}</div>
+            <ul v-if="measurementDraft.failureReasons.length" class="warns">
+              <li v-for="(r, i) in measurementDraft.failureReasons" :key="i">{{ r }}</li>
+            </ul>
+            <div v-if="measurementDraft.deviationStats">
+              RMS：{{ fmt(measurementDraft.deviationStats.rms) }}；最大：{{ fmt(measurementDraft.deviationStats.maxAbs) }}
+              <div class="deviation-bars">
+                <i v-for="(b, i) in measurementDraft.deviationStats.histogram" :key="i" :style="{ height: Math.max(3, b.count * 3) + 'px' }"></i>
+              </div>
+              <div class="hist-labels"><span>理论内</span><span>重合</span><span>理论外</span></div>
+            </div>
+            <div class="row" v-if="measurementDraft.status === 'accepted'">
+              <button @click="acceptDraftMeasurement">接受并绑定</button>
+              <button class="del" @click="discardDraftMeasurement">放弃</button>
+            </div>
+          </div>
+
+          <label class="row"><input type="checkbox" v-model="showMeasuredOverlay" /> 显示已接受覆盖层（蓝=内，绿=近，红=外）</label>
+          <button class="wide" @click="checkMeasuredOverlay" :disabled="playing || measuredCheckBusy || !activeMeasurement">
+            {{ measuredCheckBusy ? '实测覆盖层求交中…' : '暂停帧：实测覆盖层 × 对方理论轮廓' }}
+          </button>
+          <div v-if="measuredIntersectionArea !== null" class="report">
+            实测/理论局部相交面积 = {{ measuredIntersectionArea.toExponential(3) }} mm²
+            <b :class="measuredIntersectionArea > 1e-8 ? 'bad' : 'good'">
+              {{ measuredIntersectionArea > 1e-8 ? '存在局部相交 ❗' : '当前帧未检出相交 ✅' }}
+            </b>
+          </div>
+          <div v-if="activeMeasurement" class="report">
+            <b>{{ measurementStatusLabel }}</b>
+            <div>RMS {{ fmt(activeMeasurement.deviationStats!.rms) }}；|d|max {{ fmt(activeMeasurement.deviationStats!.maxAbs) }}；外部点 {{ (activeMeasurement.deviationStats!.outsideFraction * 100).toFixed(1) }}%</div>
+            <div v-if="activeMeasurement.lastCheck" class="history-check">{{ activeMeasurement.lastCheck.conclusion }}</div>
+          </div>
+          <ul class="measurelist">
+            <li v-for="m in measurementHistory" :key="m.id" :class="{ activeitem: m.id === activeMeasurementId, mismatch: m.status === 'mismatch' }">
+              <label class="row">
+                <input type="radio" :checked="m.id === activeMeasurementId" :disabled="m.status !== 'accepted'" @change="selectMeasurement(m.id)" />
+                <span>
+                  <b>{{ m.name }}</b>
+                  <em>{{ m.gearKey === 'gear1' ? '齿轮1' : '齿轮2' }} · {{ m.sourceUnit }} · {{ m.pointCount }}点</em>
+                  <small>{{ m.status === 'accepted' ? '可用于当前基准' : '历史不匹配' }}</small>
+                </span>
+              </label>
+              <div v-if="m.status !== 'accepted' || m.failureReasons.length" class="reason">{{ m.failureReasons.join('；') }}</div>
+              <div v-if="m.lastCheck" class="reason">{{ m.lastCheck.conclusion }}</div>
+              <button class="del" @click="removeMeasurement(m.id)">删</button>
+            </li>
+          </ul>
+          <div class="formula scope">{{ scopeNotice }}</div>
         </section>
 
         <section>
@@ -479,6 +719,9 @@ function preset(z1: number, z2: number, m = 2, alphaDeg = 20) {
               <div class="ci">
                 <b>{{ c.name }}</b>
                 <span>{{ c.gear1.z }}/{{ c.gear2.z }} · m={{ c.gear1.module }} · α={{ c.gear1.alphaDeg }}°{{ c.outlines ? ' · 含轮廓' : '' }}</span>
+                <span v-if="c.measurements?.length">
+                  测量：{{ c.measurements.filter(x => x.status === 'accepted').length }} 当前 · {{ c.measurements.filter(x => x.status === 'mismatch').length }} 历史不匹配
+                </span>
               </div>
               <div class="ca">
                 <button @click="loadCase(c)">载入</button>

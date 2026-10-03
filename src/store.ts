@@ -6,6 +6,7 @@
  */
 import type { LengthUnit } from './units'
 import type { GearInput, Pt } from './geometry/gear'
+import type { MeasuredProfile, MeasurementGearKey } from './geometry/measured'
 
 export const SCHEMA_VERSION = 1
 export const DB_NAME = 'spur-gear-lab'
@@ -28,6 +29,22 @@ export interface CaseData {
     gear1: Pt[]
     gear2: Pt[]
   }
+  /** 实测覆盖层历史；mismatch 是历史证据，accepted 才可用于当前案例 */
+  measurements?: MeasuredProfile[]
+  activeMeasurementId?: string | null
+}
+
+export function gearFingerprintInput(c: CaseData['gear1']) {
+  return {
+    z: c.z,
+    module: c.module,
+    alpha: c.alpha,
+    faceWidth: c.faceWidth
+  }
+}
+
+export function storedGearKey(value: unknown): value is MeasurementGearKey {
+  return value === 'gear1' || value === 'gear2'
 }
 
 let dbPromise: Promise<IDBDatabase> | null = null
@@ -61,8 +78,16 @@ function tx<T>(mode: IDBTransactionMode, fn: (store: IDBObjectStore) => IDBReque
   )
 }
 
+export function sanitizeCaseForStorage(data: CaseData): CaseData {
+  return {
+    ...data,
+    measurements: (data.measurements ?? []).filter((m) => m.status !== 'rejected')
+  }
+}
+
 export async function saveCase(data: CaseData): Promise<void> {
-  await tx('readwrite', (s) => s.put({ ...data, updatedAt: Date.now() }))
+  const safe = sanitizeCaseForStorage(data)
+  await tx('readwrite', (s) => s.put({ ...safe, updatedAt: Date.now() }))
 }
 
 export async function deleteCase(id: string): Promise<void> {
@@ -97,6 +122,25 @@ export function parseCase(text: string): CaseData {
   for (const g of [obj.gear1, obj.gear2]) {
     if (!(g.z >= 4) || !(g.module > 0) || !(g.alphaDeg > 0)) {
       throw new Error('案例参数不合法（z≥4, m>0, α>0）')
+    }
+  }
+  if (obj.measurements) {
+    if (!Array.isArray(obj.measurements)) throw new Error('实测覆盖层历史必须为数组')
+    for (const m of obj.measurements) {
+      if (!m || typeof m !== 'object') throw new Error('实测记录格式不合法')
+      if (!storedGearKey(m.gearKey)) throw new Error('实测记录缺少 gear1/gear2 绑定')
+      if (!['accepted', 'rejected', 'mismatch'].includes(m.status)) throw new Error('实测记录状态不合法')
+      if (m.status === 'rejected') throw new Error('被拒绝的测量不得写入案例；缺少失败原因或存在数据库残留')
+      if (!m.binding || typeof m.binding.theoreticalFingerprint !== 'string') {
+        throw new Error('实测记录缺少理论轮廓指纹绑定')
+      }
+      if (!m.raw || !Array.isArray(m.raw.points) || typeof m.raw.unit !== 'string') {
+        throw new Error('实测记录缺少可复核的原始坐标或单位')
+      }
+      if (m.raw.points.some((p: Pt) => !p || !Number.isFinite(p.x) || !Number.isFinite(p.y))) {
+        throw new Error('实测记录包含非有限坐标')
+      }
+      if (!m.scopeNotice) throw new Error('实测记录缺少非认证适用范围声明')
     }
   }
   return obj

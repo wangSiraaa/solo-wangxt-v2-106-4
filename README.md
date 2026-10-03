@@ -64,13 +64,19 @@ dφ1/ds = +1/r_b1,  dφ2/ds = −1/r_b2
 - **单位切换** mm/cm/m/in 只改显示换算，内部始终存 mm，实际尺寸不变；
 - 中心距、啮合角 α′、节圆、侧隙、顶隙、重合度 ε_α、基节一致性、根切/变尖检查实时显示；
 - **案例**：IndexedDB 本地保存/载入；可导出自描述 JSON（可勾选附带轮廓多边形），
-  导出文件可重新导入，且随载轮廓可直接用于 Clipper 求交（`check-roundtrip.ts` 验证）。
+  导出文件可重新导入，且随载轮廓可直接用于 Clipper 求交（`check-roundtrip.ts` 验证）；
+- **实测轮廓覆盖层（非认证）**：导入 `{ "name": "...", "unit": "mm", "coordinates": [[x,y], ...] }`
+  形式的二维闭合坐标。系统校验单位、点数、闭合、方向、零面积和自交，按质心平移与齿距相关旋转
+  对齐到对应齿轮的局部 mm 坐标（不缩放），显示有符号偏差分布；暂停帧可用 Clipper 比较实测覆盖层
+  与对方理论轮廓。记录绑定齿轮参数和理论轮廓指纹，齿数/模数/压力角/齿宽变化后转为“历史不匹配”，
+  不参与新案例计算。实测数据仅作证据与教学比对，不是啮合认证，也不替换或扩展理论模型。
 
 ## 代码结构
 
 ```
 src/geometry/gear.ts    解析尺寸、渐开线齿廓、闭合外环、输入校验
 src/geometry/mesh.ts    装配：啮合角/节圆/侧隙/顶隙/重合度、啮合线、严格啮合相位
+src/geometry/measured.ts 实测坐标校验、局部归一、偏差、理论指纹与历史状态
 src/geometry/clipper.ts Clipper2 WASM 封装（IntersectD / AreaPathsD）
 src/viewer.ts           Three.js 齿形挤出、参考圆、啮合线/接触点、干涉高亮、运动
 src/store.ts            IndexedDB 与案例 JSON 导入导出（带 schema 版本）
